@@ -1,0 +1,1475 @@
+---
+title: "FinalProject"
+author: "Chris Corona"
+date: "2022-12-12"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+## Introduction
+The Gallatin River is an important resource for the community of Bozeman, MT. It provides water for irrigation systems of many rural farming families and businesses. It is a renowned fly fishing destination that brings lots of tourist dollars to the area. Low water and droughts will negatively impact these two major economic sectors. River flows are also an indicator for the filling of local reservoirs of drinking water. It is known that the drinking water supply in Bozeman is precariously balanced with its growing population. With more growth and more drought, the water supply in this region may be insufficient. On the flip side, we have seen first hand the damages incurred from recent historic flooding this past spring. The community of Red Lodge suffered massive destruction and the road through the north entrance of Yellowstone National Park was totally destroyed from river flooding. Fortunately the Gallatin River only caused minimal damage, but we might not be so lucky next time. Measuring the river flow is an important metric to be able to predict drought and flooding which have major impacts on everyone in Bozeman.
+
+The data set in this project is a compilation of publicly available data from USGS (https://waterdata.usgs.gov/monitoring-location/06043500/) and SNOTEL websites (https://wcc.sc.egov.usda.gov/reportGenerator/). I downloaded data for the Gallatin River waterflow (CFS) measured at the mouth of the Gallatin Canyon. The weather data includes snow depth (inches), precipitation accumulation (inches), and temperature (F) from three SNOTEL weather stations within the Gallatin River watershed (Carrot Basin, Shower Falls, and Lone Mountain). Figure 1 shows a map locating all the measurement sites. I collected 10 years of hourly data for all measurements. This data was then aggregated into monthly averages so the final data set is 10 variables (3 weather variables x 3 weather stations, and 1 response) with 120 observations (12 months x 10 years).
+
+My research question asks: can we predict the monthly average flow of the Gallatin River at the mouth of the Gallatin Canyon using three weather stations at various locations upstream measuring snow depth, precipitation accumulation, and temperature?
+
+
+![watershed](gallatinriver.jpg){#id .class width=50% height=50%}
+
+## Exploratory Analysis
+Before aggregating to monthly averages, the raw data set is hourly measurements. An initial look at the raw data set shows that there is significant amounts of missing data for all measurements. Starting with the response variable `discharge`, we see that the missing data occurs in large blocks of a few days or weeks at a time. Figure 2 shows the missing blocks for one particular year. I imputed these missing values by using a Holt-Winters model trained on the data leading up to the missing block. In some cases where there was a small window of data leading up to the missing block, I resorted to using previously imputed values as part of the training. Figure 3 shows the results of one particular year of imputations. Figure 4 shows the details of the Holt-Winters imputation models. Visually, the imputations look remarkably similar to the existing data. Since I will be aggregating to monthly averages, any slight perturbations to this hourly data set will be smoothed out. Similar patterns of missingness occur in four of the years of `discharge` measurements for a total of 1787 missing observations at the hourly measurement level.
+
+```{r Format Data Response, echo=F, warning=F, message=F}
+library(tidyverse)
+library(lubridate)
+library(padr)
+
+# read in raw data
+response <- read_csv("nwis_waterservices_usgs_gov.csv", skip=28, col_names=T)
+
+# remove extraneous columns
+response <- response %>% 
+  select(date, time, timezone, discharge)
+
+# correct for daylight savings time changes (accounts for weird bug too *see below for details)
+response <- response %>% 
+  mutate(datetime=as_datetime(ifelse(timezone=="MDT",
+                                     as.POSIXct(paste(date, time),
+                                                format="%Y-%m-%d %H:%M:%S", 
+                                                tz="America/Chicago")-6*3600, # minus six hours to match local time (not UTC)
+                                     as.POSIXct(paste(date, time), 
+                                                format="%Y-%m-%d %H:%M:%S", 
+                                                tz="America/Denver")-7*3600))) # minus seven hours (even though I changed the timezone) due to bug: somehow it is automatically changing the timezone (even though I don't think it should know to do this - except a few observations fall through the cracks, I don't know why)
+# correct for observations that are somehow skipped by the bug (and need extra adjustment)
+nonbug_obs <- c(seq(102,108,by=2),       # 2012
+                seq(35045,35051,by=2),   # 2013
+                seq(65378,65382,by=2),   # 2014
+                seq(97921,97925,by=2),   # 2015
+                seq(133436,133442,by=2), # 2016
+                seq(168376,168382,by=2), # 2017
+                seq(203320,203326,by=2), # 2018
+                seq(238258,238260,by=2), # 2019
+                seq(273055,273057,by=2), # 2020
+                seq(308671,308673,by=2)) # 2021
+response$datetime[nonbug_obs] <- response$datetime[nonbug_obs] + 3600 # add an hour to these dates
+
+# thicken to hour, summarize with the mean, and pad
+response2 <- response %>% 
+  select(discharge, datetime) %>% 
+  thicken("hour") %>%
+  group_by(datetime_hour) %>%
+  summarize(discharge=mean(discharge)) %>%
+  pad()
+
+# drop the first row because it starts in the previous day
+response2 <- response2[-1,]
+```
+
+```{r Missing Values Response: Plot Missing, echo=F, warning=F, message=F}
+# check for missing data
+#library(mice)
+#md.pattern(response2, rotate.names=T)
+md_index <- which(is.na(response2$discharge))
+
+#################################################
+# inspect missing values for 2013-2014
+#################################################
+par(mfrow=c(2,1))
+plot(response2[8761:17521,], type="l", main="Nov 2013 - Oct 2014", xlab="", ylab="discharge (CFS)")
+abline(v=response2$datetime_hour[8713], col="blue")
+abline(v=response2$datetime_hour[12336], col="blue")
+rect(xleft = response2$datetime_hour[8713],
+     xright = response2$datetime_hour[12336],
+     ybottom = 0,
+     ytop = 8000,
+     col=adjustcolor("cornflowerblue", alpha=0.2))
+plot(response2[8713:12336,], type="l", main="Zoomed in: Nov 2013 - Mar 2014", xlab="", ylab="discharge (CFS)")
+```
+Figure 2: Large blocks of missing data from Nov 2013 - Oct 2014. The top plot shows the full year, and the bottom plot is the light-blue shaded region from above zoomed in to see detail.
+
+```{r Missing Values Response: Plot Imputations, echo=F, warning=F, message=F}
+# use HW model to impute missing values
+library(forecast)
+imputed_values <- data.frame(datetime_hour=response2$datetime_hour, discharge=rep(NA, length=dim(response2)[1]))
+# missing data 1
+ts1 <- ts(response2$discharge[8713:9216], start=1, frequency=24)
+m1 <- HoltWinters(ts1, alpha=0.01)
+fc1 <- predict(m1, n.ahead=480)
+imputed_values$discharge[9216] <- response2$discharge[9216]
+imputed_values$discharge[9217:9696] <- fc1
+imputed_values$discharge[9697] <- response2$discharge[9697]
+
+# missing data 2
+ts2 <- ts(response2$discharge[9722:10056], start=1, frequency=24)
+m2 <- HoltWinters(ts2, alpha=0.01)
+fc2 <- predict(m2, n.ahead=24)
+imputed_values$discharge[10056] <- response2$discharge[10056]
+imputed_values$discharge[10057:10080] <- fc2
+imputed_values$discharge[10081] <- response2$discharge[10081]
+
+# missing data 3
+ts3 <- ts(c(response2$discharge[9722:10056],
+            fc2,
+            response2$discharge[10081:10128]), start=1, frequency=24)
+m3 <- HoltWinters(ts3, alpha=0.01)
+fc3 <- predict(m3, n.ahead=72)
+imputed_values$discharge[10128] <- response2$discharge[10128]
+imputed_values$discharge[10129:10200] <- fc3
+imputed_values$discharge[10201] <- response2$discharge[10201]
+
+# missing data 4
+ts4 <- ts(c(fc2,
+            response2$discharge[10081:10128],
+            fc3,
+            response2$discharge[10201:10464]), start=1, frequency=24)
+m4 <- HoltWinters(ts4, alpha=0.01)
+fc4 <- predict(m4, n.ahead=96)
+imputed_values$discharge[10464] <- response2$discharge[10464]
+imputed_values$discharge[10465:10560] <- fc4
+imputed_values$discharge[10561] <- response2$discharge[10561]
+
+# missing data 5
+ts5 <- ts(response2$discharge[10561:11088], start=1, frequency=24)
+m5 <- HoltWinters(ts5, alpha=0.01)
+fc5 <- predict(m5, n.ahead=432)
+imputed_values$discharge[11088] <- response2$discharge[11088]
+imputed_values$discharge[11089:11520] <- fc5
+imputed_values$discharge[11521] <- response2$discharge[11521]
+
+# missing data 6
+ts6 <- ts(response2$discharge[11521:11616], start=1, frequency=24)
+m6 <- HoltWinters(ts6, alpha=0.01)
+fc6 <- predict(m6, n.ahead=48)
+imputed_values$discharge[11616] <- response2$discharge[11616]
+imputed_values$discharge[11617:11664] <- fc6
+imputed_values$discharge[11665] <- response2$discharge[11665]
+
+# plot 2013-2014 with imputed values
+par(mfrow=c(2,1))
+plot(response2[8761:17521,], type="l", main="Nov 2013 - Oct 2014", xlab="", ylab="discharge (CFS)")
+lines(imputed_values[8761:17521,], col="red")
+abline(v=response2$datetime_hour[8713], col="blue")
+abline(v=response2$datetime_hour[12336], col="blue")
+rect(xleft = response2$datetime_hour[8713],
+     xright = response2$datetime_hour[12336],
+     ybottom = 0,
+     ytop = 8000,
+     col=adjustcolor("cornflowerblue", alpha=0.2))
+plot(response2[8713:12336,], type="l", main="Zoomed in: Nov 2013 - Mar 2014", xlab="", ylab="discharge (CFS)")
+lines(imputed_values[8713:12336,], col="red")
+```
+Figure 3: Plot of the existing data in black and the imputations in red for the missing data from Nov 2013 - Oct 2014. The top plot shows the full year, and the bottom plot is the light-blue shaded region from above zoomed in to see detail.
+
+```{r Missing Values Response: Imputation Models, echo=F, warning=F, message=F}
+# plot imputing models
+par(mfrow=c(3,2))
+plot(m1, fc1)
+plot(m2, fc2)
+plot(m3, fc3)
+plot(m4, fc4)
+plot(m5, fc5)
+plot(m6, fc6)
+```
+Figure 4: Details of the Holt-Winters imputation models. The solid black line is the training data, the red line is the estimated moving average, and the dotted vertical line shows the boundary where the predictions begin. These models in order from the top of the left-hand column moving down, then to the top of the right-hand column moving down, match the sequence of missing blocks above from left to right.
+
+```{r Missing Values Response: Continue Code No Plots, echo=F, warning=F, message=F}
+#################################################
+# inspect missing values for 2014-2015
+#################################################
+#par(mfrow=c(2,1))
+#plot(response2[17522:26282,], type="l", main="Nov 2014 - Oct 2015", xlab="", ylab="discharge (CFS)")
+#abline(v=response2$datetime_hour[17473], col="blue")
+#abline(v=response2$datetime_hour[19680], col="blue")
+#rect(xleft = response2$datetime_hour[17473],
+#     xright = response2$datetime_hour[19680],
+#     ybottom = 0,
+#     ytop = 8000,
+#     col=adjustcolor("cornflowerblue", alpha=0.2))
+#plot(response2[17473:19680,], type="l", main="Zoomed in: Nov 2014 - Jan 2015", xlab="", ylab="discharge (CFS)")
+
+# use HW model to impute missing values
+# missing data 7
+ts7 <- ts(response2$discharge[17473:17688], start=1, frequency=24)
+m7 <- HoltWinters(ts7, alpha=0.01)
+fc7 <- predict(m7, n.ahead=312)
+imputed_values$discharge[17688] <- response2$discharge[17688]
+imputed_values$discharge[17688:18000] <- fc7
+imputed_values$discharge[18001] <- response2$discharge[18001]
+
+# missing data 8
+ts8 <- ts(response2$discharge[18001:18144], start=1, frequency=24)
+m8 <- HoltWinters(ts8, alpha=0.9)
+fc8 <- predict(m8, n.ahead=96)
+imputed_values$discharge[18144] <- response2$discharge[18144]
+imputed_values$discharge[18145:18240] <- fc8
+imputed_values$discharge[18241] <- response2$discharge[18241]
+
+# missing data 9
+ts9 <- ts(response2$discharge[18241:18576], start=1, frequency=24)
+m9 <- HoltWinters(ts9, alpha=0.01)
+fc9 <- predict(m9, n.ahead=24)
+imputed_values$discharge[18576] <- response2$discharge[18576]
+imputed_values$discharge[18577:18600] <- fc9
+imputed_values$discharge[18601] <- response2$discharge[18601]
+
+# missing data 10
+ts10 <- ts(response2$discharge[18601:18840], start=1, frequency=24)
+m10 <- HoltWinters(ts10, alpha=0.9)
+fc10 <- predict(m10, n.ahead=168)
+imputed_values$discharge[18840] <- response2$discharge[18840]
+imputed_values$discharge[18841:19008] <- fc10
+imputed_values$discharge[19009] <- response2$discharge[19009]
+
+# plot 2014-2015 with imputed values
+#par(mfrow=c(2,1))
+#plot(response2[17473:26282,], type="l", main="Nov 2014 - Oct 2015", xlab="", ylab="discharge (CFS)")
+#lines(imputed_values[17473:26282,], col="red")
+#abline(v=response2$datetime_hour[17473], col="blue")
+#abline(v=response2$datetime_hour[19680], col="blue")
+#rect(xleft = response2$datetime_hour[17473],
+#     xright = response2$datetime_hour[19680],
+#     ybottom = 0,
+#     ytop = 8000,
+#     col=adjustcolor("cornflowerblue", alpha=0.2))
+#plot(response2[17473:19680,], type="l", main="Zoomed in: Nov 2014 - Jan 2015", xlab="", ylab="discharge (CFS)")
+#lines(imputed_values[17473:19680,], col="red")
+#
+# plot imputing models
+#par(mfrow=c(2,2))
+#plot(m7, fc7)
+#plot(m8, fc8)
+#plot(m9, fc9)
+#plot(m10, fc10)
+
+#################################################
+# inspect missing values for 2015-2016
+#################################################
+# par(mfrow=c(2,1))
+# plot(response2[26283:35043,], type="l", main="Nov 2015 - Oct 2016", xlab="", ylab="discharge (CFS)")
+# abline(v=response2$datetime_hour[26233], col="blue")
+# abline(v=response2$datetime_hour[26952], col="blue")
+# rect(xleft = response2$datetime_hour[26233],
+#      xright = response2$datetime_hour[26952],
+#      ybottom = 0,
+#      ytop = 8000,
+#      col=adjustcolor("cornflowerblue", alpha=0.2))
+# plot(response2[26233:26952,], type="l", main="Zoomed in: Nov 2015", xlab="", ylab="discharge (CFS)")
+
+# use HW model to impute missing values
+# missing data 11
+ts11 <- ts(response2$discharge[26233:26760], start=1, frequency=24)
+m11 <- HoltWinters(ts11, alpha=0.01)
+fc11 <- predict(m11, n.ahead=24)
+imputed_values$discharge[26760] <- response2$discharge[26760]
+imputed_values$discharge[26761:26784] <- fc11
+imputed_values$discharge[26785] <- response2$discharge[26785]
+
+# plot 4th year (2015-2016) with imputed values
+# par(mfrow=c(2,1))
+# plot(response2[26283:35043,], type="l", main="Nov 2015 - Oct 2016", xlab="", ylab="discharge (CFS)")
+# lines(imputed_values[26283:35043,], col="red")
+# abline(v=response2$datetime_hour[26233], col="blue")
+# abline(v=response2$datetime_hour[26952], col="blue")
+# rect(xleft = response2$datetime_hour[26233],
+#      xright = response2$datetime_hour[26952],
+#      ybottom = 0,
+#      ytop = 8000,
+#      col=adjustcolor("cornflowerblue", alpha=0.2))
+# plot(response2[26233:26952,], type="l", main="Zoomed in: Nov 2015", xlab="", ylab="discharge (CFS)")
+# lines(imputed_values[26233:26952,], col="red")
+# 
+# #plot imputing models
+# par(mfrow=c(1,1))
+# plot(m11, fc11)
+
+#################################################
+# inspect missing values for 2019-2020
+#################################################
+# par(mfrow=c(2,1))
+# plot(response2[61297:70057,], type="l", main="Nov 2015 - Oct 2016", xlab="", ylab="discharge (CFS)")
+# abline(v=response2$datetime_hour[65665], col="blue")
+# abline(v=response2$datetime_hour[66408], col="blue")
+# rect(xleft = response2$datetime_hour[65665],
+#      xright = response2$datetime_hour[66408],
+#      ybottom = 0,
+#      ytop = 8000,
+#      col=adjustcolor("cornflowerblue", alpha=0.2))
+# plot(response2[65665:66408,], type="l", main="Zoomed in: Nov 2015", xlab="", ylab="discharge (CFS)")
+
+# missing data 12
+# fill in every-other missing with the average of the adjacent values
+md12 <- seq(66333,66375)
+for(i in md12) {
+  if(i %% 2 == 1) {imputed_values$discharge[i] <- response2$discharge[i]}
+  else {imputed_values$discharge[i] <- mean(c(response2$discharge[i-1],response2$discharge[i+1]))}
+}
+
+# plot 2019-202 with imputed values
+# par(mfrow=c(2,1))
+# plot(response2[61297:70057,], type="l", main="Nov 2019 - Oct 2020", xlab="", ylab="discharge (CFS)")
+# lines(imputed_values[61297:70057,], col="red")
+# abline(v=response2$datetime_hour[65665], col="blue")
+# abline(v=response2$datetime_hour[66408], col="blue")
+# rect(xleft = response2$datetime_hour[65665],
+#      xright = response2$datetime_hour[66408],
+#      ybottom = 0,
+#      ytop = 8000,
+#      col=adjustcolor("cornflowerblue", alpha=0.2))
+# plot(response2[65665:66408,], type="l", main="Zoomed in: May 2020", xlab="", ylab="discharge (CFS)")
+# lines(imputed_values[65665:66408,], col="red")
+
+response3 <- response2
+for(i in md_index) {response3$discharge[i] <- imputed_values$discharge[i]}
+#md.pattern(response3, rotate.names=T)
+```
+
+Next looking at the predictor variables, we also see lots of missing data. In addition, we see unreasonably high measurements probably due to malfunctions in the sensor. I started by first removing these unreasonably high measurements and treating them as missing. As opposed to before, in this case the missing data occurs as just a handful of measurements at a time with high frequency across the entire data set - from one to two missing up to twenty consecutive missing measurements. Instead of fitting models to impute these frequent but few missing values, I simply filled in the missing values with a straight line between the next adjacent existing values. Figure 5 shows the raw data and again with imputations as red points. Again, a visual inspection of the imputations shows a good fit to the existing data. In total across the nine predictor variables there were 26,861 hourly measurements missing.
+
+```{r Format Data Predictors, echo=F, warning=F, message=F}
+# read in raw data
+vars <- read_csv("snotel_carrot_basin_lone_mtn_shower_falls.csv", skip=59, col_names=T)
+
+# drop the last row to match size (exact dates/times) of response
+vars <- vars[-87648,]
+```
+
+```{r Missing Values Predictors: Plot Missing And Imputations, echo=F, warning=F, message=F}
+# check for missing data
+#md.pattern(vars, rotate.names=T)
+
+# function for imputing missing values by finding a missing value at index A+1,
+# then moving one step at a time until it finds the first non-NA at index B,
+# computes  the step value that will get us from the value at A to the value at B,
+# then goes back and fills in the NAs by incrementing the step value,
+# essentially imputing with a straight line from A to B
+# this does a surprisingly great job on this data set due to the very sporadic
+#nature of the missingness
+impute_gap <- function(y, maxgap) {
+  # store last index of vector y
+  end_of_y <- length(y)
+  # initialize vector of imputed values
+  imputed_values <- rep(NA, length(y))
+  # go through every value in sequence
+  for(i in 1:length(y)) {
+    # if we encounter an NA, then take action
+    if(is.na(y[i]) & is.na(imputed_values[i])) {
+      # initialize the gap length to 1 since we already found an NA
+      count <- 1
+      # move forward one step at a time until we reach the first non-NA value
+      # (or until we reach the end of the specified maximum gap length)
+      for(j in 1:end_of_y) {
+        # initialize token indicating within gap length
+        within_gap_length <- FALSE
+        # count the length of the gap (including the first non-NA value)
+        count <- count + 1
+        # when we encounter the first non-NA value
+        if(!is.na(y[i+j])) {
+          if(j<=maxgap) {
+            within_gap_length <- TRUE # indicate this is within the gap length
+          }
+          break # end the for loop
+        }
+      }
+      if(within_gap_length) {
+        step_val <- (y[i+j]-y[i-1])/count # compute step value
+        # reiterate through the gap, filling in values as we go
+        for(step in 1:j) {
+          # the next NA value gets the current value plus the step * step value
+          val <- y[i-1]+step*step_val
+          imputed_values[i+step-1] <- val
+        }
+      }
+      # skip i ahead to the end of the current gap
+      i <- i+j
+    }
+  }
+  return(imputed_values)
+}
+
+############################################
+# working on carrot basin snow depth
+############################################
+par(mfrow=c(2,1))
+plot(vars$cb_snow_depth, type="l", main="Carrot Basin", xlab="", ylab="snow depth (in)")
+# 1. replace erroneously high values with NAs
+md_index <- which(vars$cb_snow_depth > 120)
+vars$cb_snow_depth[md_index] <- NA
+# 2. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$cb_snow_depth))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$cb_snow_depth, 30)
+vars$cb_snow_depth[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$cb_snow_depth))
+# fill in NAs at the end of the vector
+vars$cb_snow_depth[md_index] <- 10
+plot(vars$cb_snow_depth, type="l", main="Imputed Values", xlab="", ylab="snow depth (in)")
+points(imputed_values, col="red", pch=16, cex=0.3)
+```
+Figure 5: A plot of the snow depth from Carrot Basin with raw data in black and imputations in red.
+
+```{r Missing Values Vars: Continue Code No Plots, echo=F, warning=F, message=F}
+############################################
+# working on carrot basin precip acc
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$cb_precip_accum, type="l", main="Carrot Basin", xlab="", ylab="precip acc (in)")
+# 1. replace erroneously high values with NAs
+md_index <- which(vars$cb_precip_accum > 120)
+vars$cb_precip_accum[md_index] <- NA
+# 2. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$cb_precip_accum))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$cb_precip_accum, 30)
+vars$cb_precip_accum[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$cb_snow_depth))
+#plot(vars$cb_precip_accum, type="l", main="Imputed Values", xlab="", ylab="precip accum (in)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+############################################
+# working on carrot basin temp
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$cb_temp, type="l", main="Carrot Basin", xlab="", ylab="temp (F)")
+# 1. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$cb_temp))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$cb_temp, 30)
+vars$cb_temp[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$cb_snow_depth))
+#plot(vars$cb_temp, type="l", main="Imputed Values", xlab="", ylab="temp (F)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+############################################
+# working on lone mountain snow depth
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$lm_snow_depth, type="l", main="Lone Mountain", xlab="", ylab="snow depth (in)")
+# 1. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$lm_snow_depth))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$lm_snow_depth, 30)
+vars$lm_snow_depth[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$cb_snow_depth))
+#plot(vars$lm_snow_depth, type="l", main="Imputed Values", xlab="", ylab="snow depth (in)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+############################################
+# working on lone mountain precip acc
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$lm_precip_accum, type="l", main="Lone Mountain", xlab="", ylab="precip acc (in)")
+# 1. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$lm_precip_accum))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$lm_precip_accum, 30)
+vars$lm_precip_accum[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$lm_precip_accum))
+#plot(vars$lm_precip_accum, type="l", main="Imputed Values", xlab="", ylab="precip accum (in)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+############################################
+# working on lone mountain temp
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$lm_temp, type="l", main="Lone Mountain", xlab="", ylab="temp (F)")
+# 1. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$lm_temp))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$lm_temp, 30)
+vars$lm_temp[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$lm_temp))
+#plot(vars$lm_temp, type="l", main="Imputed Values", xlab="", ylab="temp (F)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+############################################
+# working on shower falls snow depth
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$sf_snow_depth, type="l", main="Shower Falls", xlab="", ylab="snow depth (in)")
+# 1. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$sf_snow_depth))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$sf_snow_depth, 30)
+vars$sf_snow_depth[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$sf_snow_depth))
+# fill in NAs at the end of the vector
+vars$sf_snow_depth[md_index] <- 8
+#plot(vars$sf_snow_depth, type="l", main="Imputed Values", xlab="", ylab="snow depth (in)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+############################################
+# working on shower falls precip acc
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$sf_precip_accum, type="l", main="Shower Falls", xlab="", ylab="precip acc (in)")
+# 1. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$sf_precip_accum))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$sf_precip_accum, 30)
+vars$sf_precip_accum[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$sf_precip_accum))
+#plot(vars$sf_precip_accum, type="l", main="Imputed Values", xlab="", ylab="precip accum (in)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+############################################
+# working on shower falls temp
+############################################
+#par(mfrow=c(2,1))
+#plot(vars$sf_temp, type="l", main="Shower Falls", xlab="", ylab="temp (F)")
+# 1. replace NAs with imputed values (fit models, make predictions, etc)
+md_index <- which(is.na(vars$sf_temp))
+# use function on carrot basin snow depth
+imputed_values <- impute_gap(vars$sf_temp, 30)
+vars$sf_temp[md_index] <- imputed_values[md_index]
+# check for more missing data again
+md_index <- which(is.na(vars$sf_temp))
+#plot(vars$sf_temp, type="l", main="Imputed Values", xlab="", ylab="temp (F)")
+#points(imputed_values, col="red", pch=16, cex=0.3)
+
+# check for missing data
+#md.pattern(vars, rotate.names=T)
+```
+
+Once the hourly data is cleaned and has had missing values imputed, I thickened to monthly averages. Now let's look at the set of nine predictors to see if we can reduce this down. Figure 6 shows the three weather measurements from each of three SNOTEL sites. It turns out that each of the three weather stations give very similar weather measurements. Having all three weather stations is redundant, so I will choose just one: Carrot Basin.
+
+```{r Thicken Month, echo=F, message=F, warning=F}
+
+# create one big matrix
+discharge <- response3$discharge
+gallatin <- cbind(vars, discharge)
+# add one more row (repeat previous row) because I didn't collect the
+# right number of rows (due to time change issues)
+gallatin[(dim(gallatin)+1)[1],] <- gallatin[(dim(gallatin))[1],]
+
+# thicken to month because hourly data is too fine for auto.arima / holt-winters to use
+gallatin2 <- gallatin %>% 
+  thicken("month") %>%
+  group_by(date_month) %>%
+  summarize(cb_snow_depth=mean(cb_snow_depth),
+            cb_precip_accum=mean(cb_precip_accum),
+            cb_temp=mean(cb_temp),
+            discharge=mean(discharge),
+            lm_snow_depth=mean(lm_snow_depth),
+            lm_precip_accum=mean(lm_precip_accum),
+            lm_temp=mean(lm_temp),
+            sf_snow_depth=mean(sf_snow_depth),
+            sf_precip_accum=mean(sf_precip_accum),
+            sf_temp=mean(sf_temp))
+```
+
+```{r Monthly EDA: Compare Three SNOTEL Sites, echo=F, message=F, warning=F, fig.height=3}
+# assign variables
+CBsnow_depth <- as.numeric(ts(gallatin2[,2], start=1, frequency=1))
+CBprecip_accum<- as.numeric(ts(gallatin2[,3], start=1, frequency=1))
+CBtemp <- as.numeric(ts(gallatin2[,4], start=1, frequency=1))
+discharge <- as.numeric(ts(gallatin2[,5], start=1, frequency=1))
+LMsnow_depth <- as.numeric(ts(gallatin2[,6], start=1, frequency=1))
+LMprecip_accum<- as.numeric(ts(gallatin2[,7], start=1, frequency=1))
+LMtemp <- as.numeric(ts(gallatin2[,8], start=1, frequency=1))
+SFsnow_depth <- as.numeric(ts(gallatin2[,9], start=1, frequency=1))
+SFprecip_accum<- as.numeric(ts(gallatin2[,10], start=1, frequency=1))
+SFtemp <- as.numeric(ts(gallatin2[,11], start=1, frequency=1))
+
+# plot time series
+# snow depth
+plot(CBsnow_depth,
+     type="l",
+     col="red",
+     main="Compare snow depth at three SNOTEL sites",
+     xlab="Time",
+     ylab="Snow Depth (in)")
+lines(LMsnow_depth, col="blue")
+lines(SFsnow_depth, col="darkgreen")
+legend("topright", legend=c("Carrot Basin", "Lone Mountain", "Shower Falls"),col=c("red", "blue", "darkgreen"), pch=15, cex=0.5)
+
+# precip accum
+plot(CBprecip_accum,
+     type="l",
+     col="red",
+     main="Compare precip accum at three SNOTEL sites",
+     xlab="Time",
+     ylab="Precip Accum (in)")
+lines(LMprecip_accum, col="blue")
+lines(SFprecip_accum, col="darkgreen")
+legend("topright", legend=c("Carrot Basin", "Lone Mountain", "Shower Falls"),col=c("red", "blue", "darkgreen"), pch=15, cex=0.5)
+
+# temp
+plot(CBtemp,
+     type="l",
+     col="red",
+     main="Compare temperature at three SNOTEL sites",
+     xlab="Time",
+     ylab="Temp (F)")
+lines(LMtemp, col="blue")
+lines(SFtemp, col="darkgreen")
+legend("topright", legend=c("Carrot Basin", "Lone Mountain", "Shower Falls"),col=c("red", "blue", "darkgreen"), pch=15, cex=0.5)
+```
+Figure 6: Weather measurements from each of the three SNOTEL sites. Notice each weather station produces very redundant measurements.
+
+Next, we will plot the entire time series as a visual check for any obvious correlation between the covariates and the response. Figure 7 shows that the predictor `precip accum` is extremely correlated with `discharge`.`snow depth` looks like it has moderate correlation with `discharge`. And `temp` is also highly correlated with `discharge` but with some lag. All of these covariates should have good predictive power. As a final exploratory check, I will look at the autocorrelation of the response. Figure 8 shows the ACF and PACF plots of `discharge`. In the ACF plot we can see that there is definitely autocorrelation. The PACF indicates that maybe an AR(2) model is appropriate with some seasonal components.
+
+```{r, Monthly EDA: CCF, echo=F, message=F, warning=F}
+# plot time series
+plot(scale(discharge,center=F), type="l", ylim=c(0,6), main="Carrot Basin Predictors vs. Response", col=alpha("black",0.75), xlab="Time", ylab="Scaled Value")
+lines(scale(CBsnow_depth,center=F), col=alpha("red",0.75))
+lines(scale(CBprecip_accum,center=F), col=alpha("blue",0.75))
+lines(scale(CBtemp,center=F), col=alpha("darkgreen",0.75))
+legend("topright", legend=c("snow depth", "precip accum", "temp","discharge"),col=c("black", "blue", "red", "darkgreen"), pch=15)
+```
+Figure 7: Plot of the time series predictors vs. response from Carrot Basin.
+
+```{r, Monthly EDA: ACF PACF, echo=F, message=F, warning=F, fig.height=3}
+# acf pacf
+ACF <- acf(discharge, plot=F, lag.max=48)
+PACF <- pacf(discharge, plot=F,lag.max=48)
+plot(ACF, main="")
+plot(PACF, main="")
+```
+Figure 8: ACF and PACF plots for the response variable `discharge`.
+
+## Methods
+With ten years of data, I have split the train and test sets in a sequential manner to maintain the time series information.
+
+- Set 1: train = 2012-2017, test = 2018
+
+- Set 2: train = 2012-2018, test = 2019
+
+- Set 3: train = 2012-2019, test = 2020
+
+- Set 4: train = 2012-2020, test = 2021
+
+- Set 5: train = 2012-2021, test = 2022
+
+So the training set will be anywhere from five years (60 data points) to nine years (108 data points). And all the test sets will be 12 month ahead forecasts (one full year). This produces a 5-fold cross-validation that should characterize the various models plenty well. The RMSE will be used as the loss function, so we can interpret the error in terms of the original units (CFS).
+
+I will be considering seasonal ARIMA models for this data set since there is an obvious seasonal component, an AR component, and possible MA and differencing components. These models will include various combinations of the covariates as well. The seasonal ARIMA(p,d,q)(P,D,Q)$_s$ model can be succinctly expressed using the backward shift operator. 
+
+$\Theta_P(\textbf{B}^s)\theta_p(\textbf{B})(1-\textbf{B}^s)^D(1-\textbf{B}^s)^dx_t=\Phi_Q(\textbf{B}^s)\phi_q(\textbf{B})w_t$
+
+where $\Theta_P$, $\theta_p$, $\Phi_Q$, and $\phi_q$ are polynomials of order P, p, Q, and q respectively.
+
+I will also be considering a Holt-Winters model as a different approach. This model does not take any covariates. It will simply be a moving average of the response itself plus trend and seasonal components. I expect this model to perform the worst, since it does not include the additional information from the covariates.
+
+With covariates that all visually show correlation with the response, I decided to train models on all possible combinations of the covariates. Since there are only three covariates, there are only $2^3$ possible combinations: one model with no covariates, three models with one covariate, three models with two covariates, and one model with all three covariates. But since the Holt-Winters model contains no covariates, I replace the no-covariate ARIMA model with the Holt-Winters (it felt redundant otherwise).
+
+
+```{r Monthly Train Test Split, echo=F, message=F, warning=F}
+# split into train/test sets for cross validation
+# first five years train, sixth year test
+train1to5 <- gallatin2[1:(12*5),]
+test6 <- gallatin2[(12*5+1):(12*6),]
+# first six years train, seventh year test
+train1to6 <- gallatin2[1:(12*6),]
+test7 <- gallatin2[(12*6+1):(12*7),]
+# first seven years train, eighth year test
+train1to7 <- gallatin2[1:(12*7),]
+test8 <- gallatin2[(12*7+1):(12*8),] # contains an extra day (leap year)
+# first eight years train, ninth year test
+train1to8 <- gallatin2[1:(12*8),]
+test9 <- gallatin2[(12*8+1):(12*9),]
+# first eight years train, ninth year test
+train1to9 <- gallatin2[1:(12*9),]
+test10 <- gallatin2[(12*9+1):(12*10),]
+```
+
+```{r Monthly Train1to5 Test6, echo=F, message=F, warning=F}
+# assign variables
+CBsnow_depth <- ts(train1to5[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to5[,3], start=1, frequency=12)
+CBtemp <- ts(train1to5[,4], start=1, frequency=12)
+discharge <- ts(train1to5[,5], start=1, frequency=12)
+
+# arima one-predictor
+m1 <- auto.arima(discharge, xreg=cbind(CBsnow_depth))
+m2 <- auto.arima(discharge, xreg=cbind(CBprecip_accum))
+m3 <- auto.arima(discharge, xreg=cbind(CBtemp))
+fc1 <- forecast(m1, n.ahead=12, xreg=cbind(ts(test6[,2], start=1, frequency=12)))
+fc2 <- forecast(m2, n.ahead=12, xreg=cbind(ts(test6[,3], start=1, frequency=12)))
+fc3 <- forecast(m3, n.ahead=12, xreg=cbind(ts(test6[,4], start=1, frequency=12)))
+# par(mfrow=c(2,2))
+# plot(test6$discharge, main="m1: ARIMA(0,0,2)(1,1,0)[12]\ndischarge ~ snow_depth", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc1$mean, col="red")
+# lines(seq(from=1,to=12), fc1$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc1$upper[,2], col="skyblue1")
+# plot(test6$discharge, main="m2: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc2$mean, col="red")
+# lines(seq(from=1,to=12), fc2$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc2$upper[,2], col="skyblue1")
+# plot(test6$discharge, main="m3: ARIMA(1,0,1)(1,1,0)[12]\ndischarge ~ temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc3$mean, col="red")
+# lines(seq(from=1,to=12), fc3$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc3$upper[,2], col="skyblue1")
+
+# holt-winters
+mhw <- HoltWinters(discharge)
+fchw <- predict(mhw, n.ahead=12)
+# plot(test6$discharge, main="mhw: Holt-Winters", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+
+# arima multiple-predictors
+m4 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum))
+m5 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBtemp))
+m6 <- auto.arima(discharge, xreg=cbind(CBprecip_accum, CBtemp))
+m7 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum, CBtemp))
+fc4 <- forecast(m4, n.ahead=12, xreg=cbind(ts(test6[,c(2,3)], start=1, frequency=12)))
+fc4_6 <- fc4
+fc5 <- forecast(m5, n.ahead=12, xreg=cbind(ts(test6[,c(2,4)], start=1, frequency=12)))
+fc6 <- forecast(m6, n.ahead=12, xreg=cbind(ts(test6[,c(3,4)], start=1, frequency=12)))
+fc7 <- forecast(m7, n.ahead=12, xreg=cbind(ts(test6[,c(2,3,4)], start=1, frequency=12)))
+fc7_6 <- fc7
+# par(mfrow=c(2,2))
+# plot(test6$discharge, main="m4: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc4$mean, col="red")
+# lines(seq(from=1,to=12), fc4$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc4$upper[,2], col="skyblue1")
+# plot(test6$discharge, main="m5: ARIMA(0,0,1)(1,1,0)[12]\ndischarge ~ snow_depth + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc5$mean, col="red")
+# lines(seq(from=1,to=12), fc5$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc5$upper[,2], col="skyblue1")
+# plot(test6$discharge, main="m6: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc6$mean, col="red")
+# lines(seq(from=1,to=12), fc6$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc6$upper[,2], col="skyblue1")
+# plot(test6$discharge, main="m7: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc7$mean, col="red")
+# lines(seq(from=1,to=12), fc7$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc7$upper[,2], col="skyblue1")
+RMSE1 <- sqrt(mean((test6$discharge-fc1$mean)^2))
+RMSE2 <- sqrt(mean((test6$discharge-fc2$mean)^2))
+RMSE3 <- sqrt(mean((test6$discharge-fc3$mean)^2))
+RMSE4 <- sqrt(mean((test6$discharge-fc4$mean)^2))
+RMSE5 <- sqrt(mean((test6$discharge-fc5$mean)^2))
+RMSE6 <- sqrt(mean((test6$discharge-fc6$mean)^2))
+RMSE7 <- sqrt(mean((test6$discharge-fc7$mean)^2))
+RMSEhw <- sqrt(mean((test6$discharge-fchw)^2))
+RMSEk1 <- c(RMSE1,RMSE2,RMSE3,RMSE4,RMSE5,RMSE6,RMSE7,RMSEhw)
+#RMSEk1
+#match(sort(RMSEk1), RMSEk1)
+#sort(RMSEk1)
+
+# plot all models on top of each other
+# par(mfrow=c(1,1))
+# plot(test6$discharge, main="all model forecast comparison", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+# lines(seq(from=1,to=12), fc1$mean, col="orange")
+# lines(seq(from=1,to=12), fc5$mean, col="yellow")
+# lines(seq(from=1,to=12), fc3$mean, col="green")
+# lines(seq(from=1,to=12), fc6$mean, col="skyblue")
+# lines(seq(from=1,to=12), fc2$mean, col="blue")
+# lines(seq(from=1,to=12), fc7$mean, col="purple")
+# lines(seq(from=1,to=12), fc4$mean, col="gray")
+# legend("topleft", legend=c("SD","PA","T","SD+PA","SD+T","PA+T","SD+PA+T","HW"), col=c("red","orange","yellow","green","skyblue","blue","purple","gray"),pch=19)
+```
+
+```{r Monthly  Train1to6 Test7, echo=F, message=F, warning=F}
+# assign variables
+CBsnow_depth <- ts(train1to6[,2], start=1, frequency=12)
+CBprecip_accum<- ts(train1to6[,3], start=1, frequency=12)
+CBtemp <- ts(train1to6[,4], start=1, frequency=12)
+discharge <- ts(train1to6[,5], start=1, frequency=12)
+
+# arima one-predictor
+m1 <- auto.arima(discharge, xreg=cbind(CBsnow_depth))
+m2 <- auto.arima(discharge, xreg=cbind(CBprecip_accum))
+m3 <- auto.arima(discharge, xreg=cbind(CBtemp))
+fc1 <- forecast(m1, n.ahead=12, xreg=cbind(ts(test7[,2], start=1, frequency=12)))
+fc2 <- forecast(m2, n.ahead=12, xreg=cbind(ts(test7[,3], start=1, frequency=12)))
+fc3 <- forecast(m3, n.ahead=12, xreg=cbind(ts(test7[,4], start=1, frequency=12)))
+# par(mfrow=c(2,2))
+# plot(test7$discharge, main="m1: ARIMA(0,0,2)(1,1,0)[12]\ndischarge ~ snow_depth", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc1$mean, col="red")
+# lines(seq(from=1,to=12), fc1$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc1$upper[,2], col="skyblue1")
+# plot(test7$discharge, main="m2: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc2$mean, col="red")
+# lines(seq(from=1,to=12), fc2$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc2$upper[,2], col="skyblue1")
+# plot(test7$discharge, main="m3: ARIMA(1,0,1)(1,1,0)[12]\ndischarge ~ temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc3$mean, col="red")
+# lines(seq(from=1,to=12), fc3$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc3$upper[,2], col="skyblue1")
+
+# holt-winters
+mhw <- HoltWinters(discharge)
+fchw <- predict(mhw, n.ahead=12)
+# plot(test7$discharge, main="mhw: Holt-Winters", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+
+# arima multiple-predictors
+m4 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum))
+m5 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBtemp))
+m6 <- auto.arima(discharge, xreg=cbind(CBprecip_accum, CBtemp))
+m7 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum, CBtemp))
+fc4 <- forecast(m4, n.ahead=12, xreg=cbind(ts(test7[,c(2,3)], start=1, frequency=12)))
+fc4_7 <- fc4
+fc5 <- forecast(m5, n.ahead=12, xreg=cbind(ts(test7[,c(2,4)], start=1, frequency=12)))
+fc6 <- forecast(m6, n.ahead=12, xreg=cbind(ts(test7[,c(3,4)], start=1, frequency=12)))
+fc7 <- forecast(m7, n.ahead=12, xreg=cbind(ts(test7[,c(2,3,4)], start=1, frequency=12)))
+fc7_7 <- fc7
+# par(mfrow=c(2,2))
+# plot(test7$discharge, main="m4: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc4$mean, col="red")
+# lines(seq(from=1,to=12), fc4$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc4$upper[,2], col="skyblue1")
+# plot(test7$discharge, main="m5: ARIMA(0,0,1)(1,1,0)[12]\ndischarge ~ snow_depth + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc5$mean, col="red")
+# lines(seq(from=1,to=12), fc5$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc5$upper[,2], col="skyblue1")
+# plot(test7$discharge, main="m6: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc6$mean, col="red")
+# lines(seq(from=1,to=12), fc6$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc6$upper[,2], col="skyblue1")
+# plot(test7$discharge, main="m7: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc7$mean, col="red")
+# lines(seq(from=1,to=12), fc7$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc7$upper[,2], col="skyblue1")
+RMSE1 <- sqrt(mean((test7$discharge-fc1$mean)^2))
+RMSE2 <- sqrt(mean((test7$discharge-fc2$mean)^2))
+RMSE3 <- sqrt(mean((test7$discharge-fc3$mean)^2))
+RMSE4 <- sqrt(mean((test7$discharge-fc4$mean)^2))
+RMSE5 <- sqrt(mean((test7$discharge-fc5$mean)^2))
+RMSE6 <- sqrt(mean((test7$discharge-fc6$mean)^2))
+RMSE7 <- sqrt(mean((test7$discharge-fc7$mean)^2))
+RMSEhw <- sqrt(mean((test7$discharge-fchw)^2))
+RMSEk2 <- c(RMSE1,RMSE2,RMSE3,RMSE4,RMSE5,RMSE6,RMSE7,RMSEhw)
+# RMSEk2
+# match(sort(RMSEk2), RMSEk2)
+# sort(RMSEk2)
+
+# plot all models on top of each other
+# par(mfrow=c(1,1))
+# plot(test7$discharge, main="all model forecast comparison", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+# lines(seq(from=1,to=12), fc1$mean, col="orange")
+# lines(seq(from=1,to=12), fc5$mean, col="yellow")
+# lines(seq(from=1,to=12), fc3$mean, col="green")
+# lines(seq(from=1,to=12), fc6$mean, col="skyblue")
+# lines(seq(from=1,to=12), fc2$mean, col="blue")
+# lines(seq(from=1,to=12), fc7$mean, col="purple")
+# lines(seq(from=1,to=12), fc4$mean, col="gray")
+# legend("topleft", legend=c("SD","PA","T","SD+PA","SD+T","PA+T","SD+PA+T","HW"), col=c("red","orange","yellow","green","skyblue","blue","purple","gray"),pch=19)
+```
+
+```{r Monthly Train1to7 Test8, echo=F, message=F, warning=F}
+# assign variables
+CBsnow_depth <- ts(train1to7[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to7[,3], start=1, frequency=12)
+CBtemp <- ts(train1to7[,4], start=1, frequency=12)
+discharge <- ts(train1to7[,5], start=1, frequency=12)
+
+# arima one-predictor
+m1 <- auto.arima(discharge, xreg=cbind(CBsnow_depth))
+m2 <- auto.arima(discharge, xreg=cbind(CBprecip_accum))
+m3 <- auto.arima(discharge, xreg=cbind(CBtemp))
+fc1 <- forecast(m1, n.ahead=12, xreg=cbind(ts(test8[,2], start=1, frequency=12)))
+fc2 <- forecast(m2, n.ahead=12, xreg=cbind(ts(test8[,3], start=1, frequency=12)))
+fc3 <- forecast(m3, n.ahead=12, xreg=cbind(ts(test8[,4], start=1, frequency=12)))
+# par(mfrow=c(2,2))
+# plot(test8$discharge, main="m1: ARIMA(0,0,2)(1,1,0)[12]\ndischarge ~ snow_depth", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc1$mean, col="red")
+# lines(seq(from=1,to=12), fc1$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc1$upper[,2], col="skyblue1")
+# plot(test8$discharge, main="m2: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc2$mean, col="red")
+# lines(seq(from=1,to=12), fc2$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc2$upper[,2], col="skyblue1")
+# plot(test8$discharge, main="m3: ARIMA(1,0,1)(1,1,0)[12]\ndischarge ~ temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc3$mean, col="red")
+# lines(seq(from=1,to=12), fc3$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc3$upper[,2], col="skyblue1")
+
+# holt-winters
+mhw <- HoltWinters(discharge)
+fchw <- predict(mhw, n.ahead=12)
+# plot(test8$discharge, main="mhw: Holt-Winters", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+
+# arima multiple-predictors
+m4 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum))
+m5 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBtemp))
+m6 <- auto.arima(discharge, xreg=cbind(CBprecip_accum, CBtemp))
+m7 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum, CBtemp))
+fc4 <- forecast(m4, n.ahead=12, xreg=cbind(ts(test8[,c(2,3)], start=1, frequency=12)))
+fc4_8 <- fc4
+fc5 <- forecast(m5, n.ahead=12, xreg=cbind(ts(test8[,c(2,4)], start=1, frequency=12)))
+fc6 <- forecast(m6, n.ahead=12, xreg=cbind(ts(test8[,c(3,4)], start=1, frequency=12)))
+fc7 <- forecast(m7, n.ahead=12, xreg=cbind(ts(test8[,c(2,3,4)], start=1, frequency=12)))
+fc7_8 <- fc7
+# par(mfrow=c(2,2))
+# plot(test8$discharge, main="m4: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc4$mean, col="red")
+# lines(seq(from=1,to=12), fc4$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc4$upper[,2], col="skyblue1")
+# plot(test8$discharge, main="m5: ARIMA(0,0,1)(1,1,0)[12]\ndischarge ~ snow_depth + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc5$mean, col="red")
+# lines(seq(from=1,to=12), fc5$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc5$upper[,2], col="skyblue1")
+# plot(test8$discharge, main="m6: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc6$mean, col="red")
+# lines(seq(from=1,to=12), fc6$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc6$upper[,2], col="skyblue1")
+# plot(test8$discharge, main="m7: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc7$mean, col="red")
+# lines(seq(from=1,to=12), fc7$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc7$upper[,2], col="skyblue1")
+RMSE1 <- sqrt(mean((test8$discharge-fc1$mean)^2))
+RMSE2 <- sqrt(mean((test8$discharge-fc2$mean)^2))
+RMSE3 <- sqrt(mean((test8$discharge-fc3$mean)^2))
+RMSE4 <- sqrt(mean((test8$discharge-fc4$mean)^2))
+RMSE5 <- sqrt(mean((test8$discharge-fc5$mean)^2))
+RMSE6 <- sqrt(mean((test8$discharge-fc6$mean)^2))
+RMSE7 <- sqrt(mean((test8$discharge-fc7$mean)^2))
+RMSEhw <- sqrt(mean((test8$discharge-fchw)^2))
+RMSEk3 <- c(RMSE1,RMSE2,RMSE3,RMSE4,RMSE5,RMSE6,RMSE7,RMSEhw)
+# RMSEk3
+# match(sort(RMSEk3), RMSEk3)
+# sort(RMSEk3)
+# 
+# # plot all models on top of each other
+# par(mfrow=c(1,1))
+# plot(test8$discharge, main="all model forecast comparison", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+# lines(seq(from=1,to=12), fc1$mean, col="orange")
+# lines(seq(from=1,to=12), fc5$mean, col="yellow")
+# lines(seq(from=1,to=12), fc3$mean, col="green")
+# lines(seq(from=1,to=12), fc6$mean, col="skyblue")
+# lines(seq(from=1,to=12), fc2$mean, col="blue")
+# lines(seq(from=1,to=12), fc7$mean, col="purple")
+# lines(seq(from=1,to=12), fc4$mean, col="gray")
+# legend("topleft", legend=c("SD","PA","T","SD+PA","SD+T","PA+T","SD+PA+T","HW"), col=c("red","orange","yellow","green","skyblue","blue","purple","gray"),pch=19)
+```
+
+```{r Monthly Train1to8 Test9, echo=F, message=F, warning=F}
+# assign variables
+CBsnow_depth <- ts(train1to8[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to8[,3], start=1, frequency=12)
+CBtemp <- ts(train1to8[,4], start=1, frequency=12)
+discharge <- ts(train1to8[,5], start=1, frequency=12)
+
+# arima one-predictor
+m1 <- auto.arima(discharge, xreg=cbind(CBsnow_depth))
+m2 <- auto.arima(discharge, xreg=cbind(CBprecip_accum))
+m3 <- auto.arima(discharge, xreg=cbind(CBtemp))
+fc1 <- forecast(m1, n.ahead=12, xreg=cbind(ts(test9[,2], start=1, frequency=12)))
+fc2 <- forecast(m2, n.ahead=12, xreg=cbind(ts(test9[,3], start=1, frequency=12)))
+fc3 <- forecast(m3, n.ahead=12, xreg=cbind(ts(test9[,4], start=1, frequency=12)))
+# par(mfrow=c(2,2))
+# plot(test9$discharge, main="m1: ARIMA(0,0,2)(1,1,0)[12]\ndischarge ~ snow_depth", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc1$mean, col="red")
+# lines(seq(from=1,to=12), fc1$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc1$upper[,2], col="skyblue1")
+# plot(test9$discharge, main="m2: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc2$mean, col="red")
+# lines(seq(from=1,to=12), fc2$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc2$upper[,2], col="skyblue1")
+# plot(test9$discharge, main="m3: ARIMA(1,0,1)(1,1,0)[12]\ndischarge ~ temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc3$mean, col="red")
+# lines(seq(from=1,to=12), fc3$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc3$upper[,2], col="skyblue1")
+
+# holt-winters
+mhw <- HoltWinters(discharge)
+fchw <- predict(mhw, n.ahead=12)
+# plot(test9$discharge, main="mhw: Holt-Winters", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+
+# arima multiple-predictors
+m4 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum))
+m5 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBtemp))
+m6 <- auto.arima(discharge, xreg=cbind(CBprecip_accum, CBtemp))
+m7 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum, CBtemp))
+fc4 <- forecast(m4, n.ahead=12, xreg=cbind(ts(test9[,c(2,3)], start=1, frequency=12)))
+fc4_9 <- fc4
+fc5 <- forecast(m5, n.ahead=12, xreg=cbind(ts(test9[,c(2,4)], start=1, frequency=12)))
+fc6 <- forecast(m6, n.ahead=12, xreg=cbind(ts(test9[,c(3,4)], start=1, frequency=12)))
+fc7 <- forecast(m7, n.ahead=12, xreg=cbind(ts(test9[,c(2,3,4)], start=1, frequency=12)))
+fc7_9 <- fc7
+# par(mfrow=c(2,2))
+# plot(test9$discharge, main="m4: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc4$mean, col="red")
+# lines(seq(from=1,to=12), fc4$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc4$upper[,2], col="skyblue1")
+# plot(test9$discharge, main="m5: ARIMA(0,0,1)(1,1,0)[12]\ndischarge ~ snow_depth + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc5$mean, col="red")
+# lines(seq(from=1,to=12), fc5$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc5$upper[,2], col="skyblue1")
+# plot(test9$discharge, main="m6: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc6$mean, col="red")
+# lines(seq(from=1,to=12), fc6$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc6$upper[,2], col="skyblue1")
+# plot(test9$discharge, main="m7: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc7$mean, col="red")
+# lines(seq(from=1,to=12), fc7$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc7$upper[,2], col="skyblue1")
+RMSE1 <- sqrt(mean((test9$discharge-fc1$mean)^2))
+RMSE2 <- sqrt(mean((test9$discharge-fc2$mean)^2))
+RMSE3 <- sqrt(mean((test9$discharge-fc3$mean)^2))
+RMSE4 <- sqrt(mean((test9$discharge-fc4$mean)^2))
+RMSE5 <- sqrt(mean((test9$discharge-fc5$mean)^2))
+RMSE6 <- sqrt(mean((test9$discharge-fc6$mean)^2))
+RMSE7 <- sqrt(mean((test9$discharge-fc7$mean)^2))
+RMSEhw <- sqrt(mean((test9$discharge-fchw)^2))
+RMSEk4 <- c(RMSE1,RMSE2,RMSE3,RMSE4,RMSE5,RMSE6,RMSE7,RMSEhw)
+# RMSEk4
+# match(sort(RMSEk4), RMSEk4)
+# sort(RMSEk4)
+# 
+# # plot all models on top of each other
+# par(mfrow=c(1,1))
+# plot(test9$discharge, main="all model forecast comparison", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+# lines(seq(from=1,to=12), fc1$mean, col="orange")
+# lines(seq(from=1,to=12), fc5$mean, col="yellow")
+# lines(seq(from=1,to=12), fc3$mean, col="green")
+# lines(seq(from=1,to=12), fc6$mean, col="skyblue")
+# lines(seq(from=1,to=12), fc2$mean, col="blue")
+# lines(seq(from=1,to=12), fc7$mean, col="purple")
+# lines(seq(from=1,to=12), fc4$mean, col="gray")
+# legend("topleft", legend=c("SD","PA","T","SD+PA","SD+T","PA+T","SD+PA+T","HW"), col=c("red","orange","yellow","green","skyblue","blue","purple","gray"),pch=19)
+```
+
+```{r Monthly Train1to9 Test10, echo=F, message=F, warning=F}
+# assign variables
+CBsnow_depth <- ts(train1to9[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to9[,3], start=1, frequency=12)
+CBtemp <- ts(train1to9[,4], start=1, frequency=12)
+discharge <- ts(train1to9[,5], start=1, frequency=12)
+
+# arima one-predictor
+m1 <- auto.arima(discharge, xreg=cbind(CBsnow_depth))
+m2 <- auto.arima(discharge, xreg=cbind(CBprecip_accum))
+m3 <- auto.arima(discharge, xreg=cbind(CBtemp))
+fc1 <- forecast(m1, n.ahead=12, xreg=cbind(ts(test10[,2], start=1, frequency=12)))
+fc2 <- forecast(m2, n.ahead=12, xreg=cbind(ts(test10[,3], start=1, frequency=12)))
+fc3 <- forecast(m3, n.ahead=12, xreg=cbind(ts(test10[,4], start=1, frequency=12)))
+# par(mfrow=c(2,2))
+# plot(test10$discharge, main="m1: ARIMA(0,0,2)(1,1,0)[12]\ndischarge ~ snow_depth", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc1$mean, col="red")
+# lines(seq(from=1,to=12), fc1$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc1$upper[,2], col="skyblue1")
+# plot(test10$discharge, main="m2: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc2$mean, col="red")
+# lines(seq(from=1,to=12), fc2$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc2$upper[,2], col="skyblue1")
+# plot(test10$discharge, main="m3: ARIMA(1,0,1)(1,1,0)[12]\ndischarge ~ temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc3$mean, col="red")
+# lines(seq(from=1,to=12), fc3$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc3$upper[,2], col="skyblue1")
+
+# holt-winters
+mhw <- HoltWinters(discharge)
+fchw <- predict(mhw, n.ahead=12)
+# plot(test10$discharge, main="mhw: Holt-Winters", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+
+# arima multiple-predictors
+m4 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum))
+m5 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBtemp))
+m6 <- auto.arima(discharge, xreg=cbind(CBprecip_accum, CBtemp))
+m7 <- auto.arima(discharge, xreg=cbind(CBsnow_depth, CBprecip_accum, CBtemp))
+fc4 <- forecast(m4, n.ahead=12, xreg=cbind(ts(test10[,c(2,3)], start=1, frequency=12)))
+fc4_10 <- fc4
+fc5 <- forecast(m5, n.ahead=12, xreg=cbind(ts(test10[,c(2,4)], start=1, frequency=12)))
+fc6 <- forecast(m6, n.ahead=12, xreg=cbind(ts(test10[,c(3,4)], start=1, frequency=12)))
+fc7 <- forecast(m7, n.ahead=12, xreg=cbind(ts(test10[,c(2,3,4)], start=1, frequency=12)))
+fc7_10 <- fc7
+# par(mfrow=c(2,2))
+# plot(test10$discharge, main="m4: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc4$mean, col="red")
+# lines(seq(from=1,to=12), fc4$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc4$upper[,2], col="skyblue1")
+# plot(test10$discharge, main="m5: ARIMA(0,0,1)(1,1,0)[12]\ndischarge ~ snow_depth + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc5$mean, col="red")
+# lines(seq(from=1,to=12), fc5$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc5$upper[,2], col="skyblue1")
+# plot(test10$discharge, main="m6: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc6$mean, col="red")
+# lines(seq(from=1,to=12), fc6$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc6$upper[,2], col="skyblue1")
+# plot(test10$discharge, main="m7: ARIMA(2,0,0)(1,1,0)[12]\ndischarge ~ snow_depth + precip_accum + temp", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fc7$mean, col="red")
+# lines(seq(from=1,to=12), fc7$lower[,2], col="skyblue1")
+# lines(seq(from=1,to=12), fc7$upper[,2], col="skyblue1")
+RMSE1 <- sqrt(mean((test10$discharge-fc1$mean)^2))
+RMSE2 <- sqrt(mean((test10$discharge-fc2$mean)^2))
+RMSE3 <- sqrt(mean((test10$discharge-fc3$mean)^2))
+RMSE4 <- sqrt(mean((test10$discharge-fc4$mean)^2))
+RMSE5 <- sqrt(mean((test10$discharge-fc5$mean)^2))
+RMSE6 <- sqrt(mean((test10$discharge-fc6$mean)^2))
+RMSE7 <- sqrt(mean((test10$discharge-fc7$mean)^2))
+RMSEhw <- sqrt(mean((test10$discharge-fchw)^2))
+RMSEk5 <- c(RMSE1,RMSE2,RMSE3,RMSE4,RMSE5,RMSE6,RMSE7,RMSEhw)
+# RMSEk5
+# match(sort(RMSEk5), RMSEk5)
+# sort(RMSEk5)
+# 
+# plot all models on top of each other
+# par(mfrow=c(1,1))
+# plot(test10$discharge, main="all model forecast comparison", xlab="Time", ylab="Discharge (CFS)", type="p", pch=19)
+# lines(seq(from=1,to=12), fchw, col="red")
+# lines(seq(from=1,to=12), fc1$mean, col="orange")
+# lines(seq(from=1,to=12), fc5$mean, col="yellow")
+# lines(seq(from=1,to=12), fc3$mean, col="green")
+# lines(seq(from=1,to=12), fc6$mean, col="skyblue")
+# lines(seq(from=1,to=12), fc2$mean, col="blue")
+# lines(seq(from=1,to=12), fc7$mean, col="purple")
+# lines(seq(from=1,to=12), fc4$mean, col="gray")
+# legend("topleft", legend=c("SD","PA","T","SD+PA","SD+T","PA+T","SD+PA+T","HW"), col=c("red","orange","yellow","green","skyblue","blue","purple","gray"),pch=19)
+```
+
+```{r Monthly K-Fold Average RMSE, echo=F, message=F, warning=F}
+RMSEktotal <- rep(NA, 8)
+for(i in 1:8){
+  RMSEktotal[i] <- round(mean(RMSEk1[i],RMSEk2[i],RMSEk3[i],RMSEk4[i],RMSEk5[i]),1)
+}
+RMSEktotal
+match(sort(RMSEktotal), RMSEktotal)
+sort(RMSEktotal)
+```
+## Results
+
+After performing 5-fold cross-validation for 12 month ahead forecasts on all eight models, we have results. It turns out that all seven SARIMA models perform similarly well. The best model is the two covariate SArIMA model: discharge ~ snow_depth + precip_accum with 5-fold average RMSE 489.3. And as expected, the Holt-Winters model has the worst performance with 5-fold average RMSE 542.9. Table 1 displays results for all the models. Also interesting, the top four best models all have the same SARIMA framework: (2,0,0)(2,1,0)[12] which matches our expectations from the PACF plot in the exploratory analysis above. The predictor `precip_accum` appears to be the best covariate since it appears in all of the top four best models, with `snow_depth` being a close second as it appears in the top two best models. Figure 9 shows all the predictions for the best two models compared to the true `discharge`. The predictions are almost indistinguishable between the two models, and the RMSE are so close that we would expect them to be almost identical models. For each of these models there are only three (maybe four) true `discharge` points that lie outside the confidence intervals.
+
+```{r Table of Models, echo=F, message=F, warning=F}
+library(knitr)
+model_table <- data.frame(no.covariates=c(2,3,1,2,1,1,2,0),
+                          type=c(rep("SARIMA",7), "Holt-Winters"),
+                          details=c("(2,0,0)(2,1,0)[12]",
+                                    "(2,0,0)(2,1,0)[12]",
+                                    "(2,0,0)(2,1,0)[12]",
+                                    "(2,0,0)(2,1,0)[12]",
+                                    "(1,0,0)(2,1,0)[12]",
+                                    "(1,0,0)(2,1,0)[12]",
+                                    "(0,0,1)(2,1,0)[12]",
+                                    "beta=T, gamma=T"),
+                          covariates=c("snow_depth + precip_accum",
+                                       "snow_depth + precip_accum + temp",
+                                       "precip_accum",
+                                       "precip_accum + temp",
+                                       "temp",
+                                       "snow_depth",
+                                       "snow_depth + temp",
+                                       "none"),
+                          RMSE=sort(RMSEktotal))
+kable(model_table, align="clll", format="pipe")
+```
+Table 1: List of all eight models and RMSE score.
+
+```{r Plot Predictions m4, echo=F, message=F, warning=F}
+# m4
+plot(train1to5$discharge, type="l", col="black", xlim=c(0,120), ylim=c(0,4500), xlab="Month", ylab="Discharge (CFS)", main="discharge ~ precip_acum + snow_depth Predictions")
+polygon(c(seq(61,72), rev(seq(61,72))), c(fc4_6$upper[,2], rev(fc4_6$lower[,2])), col = "salmon", lty = 0)
+lines(seq(61,72), fc4_6$mean, col="red")
+points(seq(61,72), test6$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(73,84), rev(seq(73,84))), c(fc4_7$upper[,2], rev(fc4_7$lower[,2])), col = "salmon", lty = 0)
+lines(seq(73,84), fc4_7$mean, col="red")
+points(seq(73,84), test7$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(85,96), rev(seq(85,96))), c(fc4_8$upper[,2], rev(fc4_8$lower[,2])), col = "salmon", lty = 0)
+lines(seq(85,96), fc4_8$mean, col="red")
+points(seq(85,96), test8$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(97,108), rev(seq(97,108))), c(fc4_9$upper[,2], rev(fc4_9$lower[,2])), col = "salmon", lty = 0)
+lines(seq(97,108), fc4_9$mean, col="red")
+points(seq(97,108), test9$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(109,120), rev(seq(109,120))), c(fc4_10$upper[,2], rev(fc4_10$lower[,2])), col = "salmon", lty = 0)
+lines(seq(109,120), fc4_10$mean, col="red")
+points(seq(109,120), test10$discharge, col="black", pch=16, cex=.5)
+
+# m7
+plot(train1to5$discharge, type="l", col="black", xlim=c(0,120), ylim=c(0,4500), xlab="Month", ylab="Discharge (CFS)", main="discharge ~ precip_acum + snow_depth + temp Predictions")
+polygon(c(seq(61,72), rev(seq(61,72))), c(fc7_6$upper[,2], rev(fc7_6$lower[,2])), col = "steelblue1", lty = 0)
+lines(seq(61,72), fc7_6$mean, col="steelblue")
+points(seq(61,72), test6$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(73,84), rev(seq(73,84))), c(fc7_7$upper[,2], rev(fc7_7$lower[,2])), col = "steelblue1", lty = 0)
+lines(seq(73,84), fc7_7$mean, col="steelblue")
+points(seq(73,84), test7$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(85,96), rev(seq(85,96))), c(fc7_8$upper[,2], rev(fc7_8$lower[,2])), col = "steelblue1", lty = 0)
+lines(seq(85,96), fc7_8$mean, col="steelblue")
+points(seq(85,96), test8$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(97,108), rev(seq(97,108))), c(fc7_9$upper[,2], rev(fc7_9$lower[,2])), col = "steelblue1", lty = 0)
+lines(seq(97,108), fc7_9$mean, col="steelblue")
+points(seq(97,108), test9$discharge, col="black", pch=16, cex=.5)
+
+polygon(c(seq(109,120), rev(seq(109,120))), c(fc7_10$upper[,2], rev(fc7_10$lower[,2])), col = "steelblue1", lty = 0)
+lines(seq(109,120), fc7_10$mean, col="steelblue")
+points(seq(109,120), test10$discharge, col="black", pch=16, cex=.5)
+```
+Figure 9: Plots of the best two models' predictions with shaded 95% confidence intervals and true `discharge` as black points.
+
+As a final step in this analysis, I wanted to look at the ignorance scores of these top two performing models. To do so, I have to first fit Bayesian SARIMA models in order to obtain posterior distributions. I used the `stan_sarima` function from the `bayesforecast` package to fit the models. The MCMC process used four chains of 2,000 iterations each after a warm-up of 1,000 iterations. I assume convergence because the Rhat from these simulations are all extremely close to one (within three significant digits) for all parameters, and the Neff ranges from 1,500 to 5,500 out of 8,000 possible iterations (4 chains x 2,000 iterations each). After obtaining the posterior distribution, I used the `logs_sample` function from the `scoringRules` package to compute the ignorance scores. I used the same 5-fold cross-validation methodology to find the average ignorance score for each month in the 12 month ahead forecast. The results of the ignorance scores are in Table 2.
+
+```{r Monthly Bayesian Models, eval=F, echo=F, message=F, warning=F}
+# initialize ignorance score matrices
+ign_m4 <- matrix(NA, nrow=5, ncol=12)
+ign_m7 <- matrix(NA, nrow=5, ncol=12)
+
+#######################
+# train1to5
+#######################
+
+# define variables
+discharge <- ts(train1to5[,5], start=1, frequency=12)
+CBsnow_depth <- ts(train1to5[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to5[,3], start=1, frequency=12)
+CBtemp <- ts(train1to5[,4], start=1, frequency=12)
+
+library(bayesforecast)
+# bayesian model for best model above: m4 discharge ~ snow_depth + precip_accum
+sm1 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# bayesian model for 2nd best model above: m7 discharge ~ snow_depth + precip_accum + temp
+sm2 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum), 
+                              as.numeric(CBtemp)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# posterior draws for 12 steps ahead prediction for top two models
+posterior_sm1 <- posterior_predict(sm1, 
+                                   h=12,
+                                   xreg=test6[,c(2,3)])
+posterior_sm2 <- posterior_predict(sm2, 
+                                   h=12,
+                                   xreg=test6[,c(2,3,4)])
+
+# ignorance scores for top two models
+library(scoringRules)
+for(i in 1:12) {
+  ign_m4[1,i] <-  logs_sample(y=test6$discharge[i], dat=posterior_sm1[,i])
+  ign_m7[1,i] <-  logs_sample(y=test6$discharge[i], dat=posterior_sm2[,i])
+}
+
+#######################
+# train1to6
+#######################
+
+# define variables
+discharge <- ts(train1to6[,5], start=1, frequency=12)
+CBsnow_depth <- ts(train1to6[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to6[,3], start=1, frequency=12)
+CBtemp <- ts(train1to6[,4], start=1, frequency=12)
+
+# bayesian model for best model above: m4 discharge ~ snow_depth + precip_accum
+sm1 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# bayesian model for 2nd best model above: m7 discharge ~ snow_depth + precip_accum + temp
+sm2 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum), 
+                              as.numeric(CBtemp)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# posterior draws for 12 steps ahead prediction for top two models
+posterior_sm1 <- posterior_predict(sm1, 
+                                   h=12,
+                                   xreg=test7[,c(2,3)])
+posterior_sm2 <- posterior_predict(sm2, 
+                                   h=12,
+                                   xreg=test7[,c(2,3,4)])
+
+# ignorance scores for top two models
+for(i in 1:12) {
+  ign_m4[2,i] <-  logs_sample(y=test7$discharge[i], dat=posterior_sm1[,i])
+  ign_m7[2,i] <-  logs_sample(y=test7$discharge[i], dat=posterior_sm2[,i])
+}
+
+#######################
+# train1to7
+#######################
+
+# define variables
+discharge <- ts(train1to7[,5], start=1, frequency=12)
+CBsnow_depth <- ts(train1to7[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to7[,3], start=1, frequency=12)
+CBtemp <- ts(train1to7[,4], start=1, frequency=12)
+
+# bayesian model for best model above: m4 discharge ~ snow_depth + precip_accum
+sm1 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# bayesian model for 2nd best model above: m7 discharge ~ snow_depth + precip_accum + temp
+sm2 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum), 
+                              as.numeric(CBtemp)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# posterior draws for 12 steps ahead prediction for top two models
+posterior_sm1 <- posterior_predict(sm1, 
+                                   h=12,
+                                   xreg=test8[,c(2,3)])
+posterior_sm2 <- posterior_predict(sm2, 
+                                   h=12,
+                                   xreg=test8[,c(2,3,4)])
+
+# ignorance scores for top two models
+for(i in 1:12) {
+  ign_m4[3,i] <-  logs_sample(y=test8$discharge[i], dat=posterior_sm1[,i])
+  ign_m7[3,i] <-  logs_sample(y=test8$discharge[i], dat=posterior_sm2[,i])
+}
+
+#######################
+# train1to8
+#######################
+
+# define variables
+discharge <- ts(train1to8[,5], start=1, frequency=12)
+CBsnow_depth <- ts(train1to8[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to8[,3], start=1, frequency=12)
+CBtemp <- ts(train1to8[,4], start=1, frequency=12)
+
+# bayesian model for best model above: m4 discharge ~ snow_depth + precip_accum
+sm1 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# bayesian model for 2nd best model above: m7 discharge ~ snow_depth + precip_accum + temp
+sm2 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum), 
+                              as.numeric(CBtemp)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+
+# posterior draws for 12 steps ahead prediction for top two models
+posterior_sm1 <- posterior_predict(sm1, 
+                                   h=12,
+                                   xreg=test9[,c(2,3)])
+posterior_sm2 <- posterior_predict(sm2, 
+                                   h=12,
+                                   xreg=test9[,c(2,3,4)])
+
+# ignorance scores for top two models
+for(i in 1:12) {
+  ign_m4[4,i] <-  logs_sample(y=test9$discharge[i], dat=posterior_sm1[,i])
+  ign_m7[4,i] <-  logs_sample(y=test9$discharge[i], dat=posterior_sm2[,i])
+}
+
+#######################
+# train1to9
+#######################
+
+# define variables
+discharge <- ts(train1to9[,5], start=1, frequency=12)
+CBsnow_depth <- ts(train1to9[,2], start=1, frequency=12)
+CBprecip_accum <- ts(train1to9[,3], start=1, frequency=12)
+CBtemp <- ts(train1to9[,4], start=1, frequency=12)
+
+# bayesian model for best model above: m4 discharge ~ snow_depth + precip_accum
+sm1 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# bayesian model for 2nd best model above: m7 discharge ~ snow_depth + precip_accum + temp
+sm2 <- stan_sarima(as.numeric(discharge),
+                   order=c(2,0,0),
+                   seasonal=c(2,1,0),
+                   xreg=cbind(as.numeric(CBsnow_depth),
+                              as.numeric(CBprecip_accum), 
+                              as.numeric(CBtemp)),
+                   iter=2000,
+                   chains=4,
+                   warmup = 1000,
+                   refresh=0)
+
+# posterior draws for 12 steps ahead prediction for top two models
+posterior_sm1 <- posterior_predict(sm1, 
+                                   h=12,
+                                   xreg=test10[,c(2,3)])
+posterior_sm2 <- posterior_predict(sm2, 
+                                   h=12,
+                                   xreg=test10[,c(2,3,4)])
+
+
+
+# ignorance scores for top two models
+for(i in 1:12) {
+  ign_m4[5,i] <-  logs_sample(y=test10$discharge[i], dat=posterior_sm1[,i])
+  ign_m7[5,i] <-  logs_sample(y=test10$discharge[i], dat=posterior_sm2[,i])
+}
+```
+
+```{r Monthly Ignorance Scores, echo=F, message=F, warning=F}
+avg_ign_m4 <- c(7.415870, 7.266354, 7.167804, 7.201289, 7.273644, 7.352401, 15.906762, 26.482068, 7.604127, 7.384580, 7.557044, 7.426139)
+avg_ign_m7 <- c(7.507205, 7.367533, 7.164513, 7.180823, 7.213526, 7.388678, 12.404566, 25.928281, 7.440319, 7.702115, 7.88400,  7.257925)
+
+ignorance_scores <- data.frame(month=c("Nov","Dec","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct"),
+                               best_model=avg_ign_m4,
+                               next_best_model=avg_ign_m7)
+kable(ignorance_scores, align="lll")
+```
+Table 2: Ignorance scores for the 5-fold cross-validated 12 month ahead predictions for the best two models
+
+## Discussion
+
+Each of the eight models performed similarly, with the top seven models (SARIMA with different covariates) being nearly identical and the eighth (Holt-Winters) only slightly off. Analyzing this, we can say that each of the three predictors: precipitation accumulation, snow depth, and temperature did a good job at predicting water flow in the Gallatin River at the mouth of the canyon. The  best predictor in this data set is precipitation accumulation, and the worst predictor in this data set, temperature, still did a pretty good job. The different sets of covariates as predictors did not create any marked difference in performance. Therefore, the best model is probably the SARIMA model with just precipitation accumulation as the only covariate since one predictor is the simplest and most interpretable. It was interesting to perform a Bayesian analysis too. I'm glad I tried (and succeeded) in fitting a Bayesian time series model and applied an ignorance score as the loss function. This is an important and more modern approach to time series analysis. I appreciate all that you have taught me. Thanks for reading!
